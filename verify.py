@@ -9,6 +9,8 @@ Reconstructs U, V, W from the inlined CSE program (no npz, no JSON), then:
 Conventions: A, B, C are flattened row-major: A[i,l] -> 3*i+l, etc.
 """
 
+import numpy as np
+
 SIDES = {
     'U': {
         'base_dim': 9,
@@ -78,7 +80,7 @@ W = [tuple(W_cols[c][r] for c in range(9)) for r in range(RANK)]   # row r of pr
 
 
 def brent(mod=None):
-    bad = 0
+    bad = 0; mx = 0; total = 0
     for i in range(3):
         for l in range(3):
             for lp in range(3):
@@ -90,9 +92,12 @@ def brent(mod=None):
                             d = s - (1 if (i == ip and j == jp and l == lp) else 0)
                             if mod is not None:
                                 d %= mod
+                            total += 1
                             if d:
                                 bad += 1
-    return bad
+                                mx = max(mx, abs(int(d)))
+    return {'equations': total, 'bad': bad, 'max_abs_residual': mx,
+            'modulus': 'Z' if mod is None else f'GF({mod})'}
 
 D = 9
 ZERO = (0,) * D
@@ -209,7 +214,100 @@ def optimality():
         'V_targets': len(TV), 'V_pure_at_11_possible': V_pure,
         'V_aux1_at_12_possible': V_q1,
         'V_lb': 13 if (not V_pure and not V_q1) else None,
+        'all_claimed_input_optimality_checks_pass':
+            (len(TU) == 12 and not U_pure and len(TV) == 11
+             and not V_pure and not V_q1),
     }
+
+
+def slp_eval(side, base_values):
+    """Evaluate the side's straight-line program on arbitrary base values
+    (scalars or numpy arrays). Returns the list of final outputs."""
+    vs = list(base_values)
+    for a, s, b in side['inter']:
+        vs.append(vs[a] + s*vs[b])
+    out = []
+    zero = 0*vs[0]
+    for f in side['final']:
+        acc = None
+        for idx, c in f:
+            term = c*vs[idx]
+            acc = term if acc is None else acc + term
+        out.append(acc if acc is not None else zero)
+    return out
+
+
+EXPECTED_COSTS = {'U': 13, 'V': 13, 'W': 30}
+EXPECTED_TOTAL = 56
+
+
+def cse_cross_check():
+    """Self-consistency: each side's recomputed addition cost matches the
+    declared (13/13/30, total 56), and every expanded factor row is ternary
+    (entries in {-1,0,1})."""
+    out = {}; ok = True
+    for s in 'UVW':
+        c = cost(SIDES[s])
+        rows = expand(SIDES[s])
+        ternary = all(x in (-1, 0, 1) for r in rows for x in r)
+        match = (c == EXPECTED_COSTS[s])
+        out[s] = {'cost_recomputed': c, 'cost_expected': EXPECTED_COSTS[s],
+                  'ternary_entries': ternary, 'ok': match and ternary}
+        ok = ok and match and ternary
+    out['total_recomputed'] = sum(out[s]['cost_recomputed'] for s in 'UVW')
+    out['total_expected'] = EXPECTED_TOTAL
+    out['all_ok'] = ok and out['total_recomputed'] == EXPECTED_TOTAL
+    return out
+
+
+def random_factor_trials(mod=None, trials=1000, seed=56):
+    """Sample random integer A,B (3x3), evaluate the SLP, compare to A@B
+    (optionally mod a prime). Returns True iff every trial agrees."""
+    rng = np.random.default_rng(seed + (mod or 0))
+    for _ in range(trials):
+        A = rng.integers(-3, 4, size=(3, 3), dtype=int)
+        B = rng.integers(-3, 4, size=(3, 3), dtype=int)
+        if mod:
+            A = A % mod; B = B % mod
+        avec = [int(A[k // 3, k % 3]) for k in range(9)]
+        bvec = [int(B[k // 3, k % 3]) for k in range(9)]
+        u = slp_eval(SIDES['U'], avec)
+        v = slp_eval(SIDES['V'], bvec)
+        prods = [u[r] * v[r] for r in range(RANK)]
+        cvals = slp_eval(SIDES['W'], prods)
+        C = np.array([[cvals[3*i + j] for j in range(3)] for i in range(3)],
+                     dtype=int)
+        E = A @ B
+        if mod:
+            C = C % mod; E = E % mod
+        if not np.array_equal(C, E):
+            return False
+    return True
+
+
+def noncomm_trials(trials=200, seed=5600):
+    """Replace each scalar entry of A,B with a random 2x2 integer matrix and
+    verify the SLP using non-commutative @-products. Catches any hidden use
+    of commutativity in the algorithm."""
+    rng = np.random.default_rng(seed)
+    for _ in range(trials):
+        A = [[rng.integers(-2, 3, size=(2, 2), dtype=int) for _ in range(3)]
+             for __ in range(3)]
+        B = [[rng.integers(-2, 3, size=(2, 2), dtype=int) for _ in range(3)]
+             for __ in range(3)]
+        avec = [A[i][j] for i in range(3) for j in range(3)]
+        bvec = [B[i][j] for i in range(3) for j in range(3)]
+        u = slp_eval(SIDES['U'], avec)
+        v = slp_eval(SIDES['V'], bvec)
+        prods = [u[r] @ v[r] for r in range(RANK)]
+        cvals = slp_eval(SIDES['W'], prods)
+        for i in range(3):
+            for j in range(3):
+                exp = sum((A[i][l] @ B[l][j] for l in range(3)),
+                          start=np.zeros((2, 2), dtype=int))
+                if not np.array_equal(cvals[3*i + j], exp):
+                    return False
+    return True
 
 
 if __name__ == '__main__':
@@ -217,9 +315,22 @@ if __name__ == '__main__':
     print(f"rank                     : {RANK}")
     print(f"additions  U / V / W     : {cU} / {cV} / {cW}   (total {cU+cV+cW})")
     for mod in (None, 2, 3):
-        bad = brent(mod)
-        label = 'Z' if mod is None else f'GF({mod})'
-        print(f"Brent over {label:6s}        : {'OK' if bad == 0 else f'FAIL ({bad})'}")
+        r = brent(mod)
+        status = 'OK' if r['bad'] == 0 else f"FAIL ({r['bad']})"
+        print(f"Brent over {r['modulus']:6s}        : {status}   "
+              f"equations={r['equations']}   max_abs_residual={r['max_abs_residual']}")
+    cc = cse_cross_check()
+    for s in 'UVW':
+        d = cc[s]
+        print(f"CSE side {s}                : cost {d['cost_recomputed']} "
+              f"(expected {d['cost_expected']})   ternary={d['ternary_entries']}   "
+              f"ok={d['ok']}")
+    print(f"CSE total                : {cc['total_recomputed']} "
+          f"(expected {cc['total_expected']})   all_ok={cc['all_ok']}")
+    print(f"random factor trials Z   : {'OK' if random_factor_trials(None, 1000) else 'FAIL'}   (1000 trials)")
+    print(f"random factor trials GF2 : {'OK' if random_factor_trials(2, 1000) else 'FAIL'}   (1000 trials)")
+    print(f"random factor trials GF3 : {'OK' if random_factor_trials(3, 1000) else 'FAIL'}   (1000 trials)")
+    print(f"non-commutative 2x2 SLP  : {'OK' if noncomm_trials(200) else 'FAIL'}   (200 trials)")
     opt = optimality()
     print(f"U distinct targets       : {opt['U_targets']}   "
           f"pure-chain at 12 possible: {opt['U_pure_at_12_possible']}   "
@@ -228,3 +339,5 @@ if __name__ == '__main__':
           f"pure-chain at 11 possible: {opt['V_pure_at_11_possible']}   "
           f"+1aux at 12 possible: {opt['V_aux1_at_12_possible']}   "
           f"lb = {opt['V_lb']}")
+    print(f"all_claimed_input_optimality_checks_pass : "
+          f"{opt['all_claimed_input_optimality_checks_pass']}")
